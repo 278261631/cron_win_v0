@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import List, Optional
 
 from croniter import croniter
-from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtGui import QTextCursor
+from PySide6.QtCore import QEvent, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -25,6 +25,9 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QMenu,
+    QStyle,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -245,6 +248,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Python Cron GUI")
         self.resize(980, 620)
+        self.is_quit_requested = False
 
         self.tasks = self.load_tasks()
         self.engine = SchedulerEngine(self.tasks)
@@ -290,9 +294,59 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("运行日志"), 0)
         layout.addWidget(self.log_box, 1)
         self.setCentralWidget(root)
+        self.setup_tray()
 
         self.ensure_next_runs()
         self.refresh_table()
+
+    def setup_tray(self) -> None:
+        self.tray_icon = QSystemTrayIcon(self)
+        tray_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        self.tray_icon.setIcon(tray_icon)
+        self.setWindowIcon(tray_icon)
+        self.tray_icon.setToolTip("Python Cron GUI")
+
+        tray_menu = QMenu(self)
+        show_action = QAction("显示主窗口", self)
+        quit_action = QAction("退出程序", self)
+        show_action.triggered.connect(self.show_from_tray)
+        quit_action.triggered.connect(self.quit_from_tray)
+        tray_menu.addAction(show_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.show()
+
+    def on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.show_from_tray()
+
+    def show_from_tray(self) -> None:
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+    def quit_from_tray(self) -> None:
+        self.is_quit_requested = True
+        self.tray_icon.hide()
+        QApplication.instance().quit()
+
+    def closeEvent(self, event) -> None:
+        if self.is_quit_requested:
+            event.accept()
+            return
+        self.hide()
+        event.ignore()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and self.isMinimized():
+            QTimer.singleShot(0, self.hide)
 
     def ensure_next_runs(self) -> None:
         for task in self.tasks:
@@ -483,6 +537,7 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     win = MainWindow()
     win.show()
     return app.exec()
