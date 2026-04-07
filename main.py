@@ -1,15 +1,18 @@
 import json
+import re
 import subprocess
 import sys
 import threading
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from typing import List, Optional
 
 from croniter import croniter
 from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -22,9 +25,9 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QPlainTextEdit,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -114,7 +117,7 @@ class TaskDialog(QDialog):
 
 class SchedulerEngine(QWidget):
     task_updated = Signal()
-    log_generated = Signal(str)
+    log_generated = Signal(str, str)
 
     def __init__(self, tasks: List[Task]) -> None:
         super().__init__()
@@ -165,20 +168,50 @@ class SchedulerEngine(QWidget):
             cmd = task.command
             reason = "手动触发" if manual else "定时触发"
             self.log_generated.emit(
-                f"[{start.strftime(DATE_FMT)}] [{task.name}] 开始执行 ({reason}): {cmd}"
+                f"[{start.strftime(DATE_FMT)}] [{task.name}] 开始执行 ({reason}): {cmd}",
+                "info",
             )
             try:
-                proc = subprocess.run(
+                proc = subprocess.Popen(
                     cmd,
                     shell=True,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    check=False,
+                    bufsize=1,
                 )
+
+                def stream_output(pipe, stream_name: str) -> None:
+                    if pipe is None:
+                        return
+                    buf = ""
+                    while True:
+                        ch = pipe.read(1)
+                        if ch == "":
+                            if buf:
+                                self.log_generated.emit(f"[{task.name}] {buf}", stream_name)
+                            break
+                        if ch in ("\r", "\n"):
+                            if buf:
+                                self.log_generated.emit(f"[{task.name}] {buf}", stream_name)
+                                buf = ""
+                            continue
+                        buf += ch
+
+                t_out = threading.Thread(
+                    target=stream_output, args=(proc.stdout, "stdout"), daemon=True
+                )
+                t_err = threading.Thread(
+                    target=stream_output, args=(proc.stderr, "stderr"), daemon=True
+                )
+                t_out.start()
+                t_err.start()
+                t_out.join()
+                t_err.join()
+
+                return_code = proc.wait()
                 end = datetime.now()
-                output = (proc.stdout or "").strip()
-                err = (proc.stderr or "").strip()
-                status = "成功" if proc.returncode == 0 else f"失败({proc.returncode})"
+                status = "成功" if return_code == 0 else f"失败({return_code})"
 
                 with self.lock:
                     task.last_run = end.strftime(DATE_FMT)
@@ -186,12 +219,9 @@ class SchedulerEngine(QWidget):
                     if manual and task.enabled:
                         self.recalc_next_run(task, end)
 
-                if output:
-                    self.log_generated.emit(f"[{task.name}] stdout:\n{output}")
-                if err:
-                    self.log_generated.emit(f"[{task.name}] stderr:\n{err}")
                 self.log_generated.emit(
-                    f"[{end.strftime(DATE_FMT)}] [{task.name}] 执行完成: {status}"
+                    f"[{end.strftime(DATE_FMT)}] [{task.name}] 执行完成: {status}",
+                    "info",
                 )
             except Exception as exc:
                 fail_time = datetime.now()
@@ -199,7 +229,8 @@ class SchedulerEngine(QWidget):
                     task.last_run = fail_time.strftime(DATE_FMT)
                     task.last_status = f"异常: {exc}"
                 self.log_generated.emit(
-                    f"[{fail_time.strftime(DATE_FMT)}] [{task.name}] 执行异常: {exc}"
+                    f"[{fail_time.strftime(DATE_FMT)}] [{task.name}] 执行异常: {exc}",
+                    "stderr",
                 )
             finally:
                 self.task_updated.emit()
@@ -208,6 +239,8 @@ class SchedulerEngine(QWidget):
 
 
 class MainWindow(QMainWindow):
+    ANSI_RE = re.compile(r"\x1b\[([0-9;]*)m")
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Python Cron GUI")
@@ -228,7 +261,7 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setAlternatingRowColors(True)
 
-        self.log_box = QPlainTextEdit()
+        self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
 
         add_btn = QPushButton("新增")
@@ -375,8 +408,77 @@ class MainWindow(QMainWindow):
                 item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable)
                 self.table.setItem(row, col, item)
 
-    def append_log(self, message: str) -> None:
-        self.log_box.appendPlainText(message)
+    @classmethod
+    def ansi_to_html(cls, text: str, default_color: Optional[str] = None) -> str:
+        fg_map = {
+            30: "#000000",
+            31: "#cd3131",
+            32: "#0dbc79",
+            33: "#e5e510",
+            34: "#2472c8",
+            35: "#bc3fbc",
+            36: "#11a8cd",
+            37: "#e5e5e5",
+            90: "#666666",
+            91: "#f14c4c",
+            92: "#23d18b",
+            93: "#f5f543",
+            94: "#3b8eea",
+            95: "#d670d6",
+            96: "#29b8db",
+            97: "#ffffff",
+        }
+
+        def apply_style(s: str, color: Optional[str], bold: bool) -> str:
+            if not s:
+                return ""
+            styles = []
+            if color:
+                styles.append(f"color:{color}")
+            if bold:
+                styles.append("font-weight:600")
+            style_attr = f" style=\"{';'.join(styles)}\"" if styles else ""
+            return f"<span{style_attr}>{escape(s)}</span>"
+
+        current_color = default_color
+        current_bold = False
+        html_parts: List[str] = []
+        last = 0
+
+        for match in cls.ANSI_RE.finditer(text):
+            chunk = text[last : match.start()]
+            html_parts.append(apply_style(chunk, current_color, current_bold))
+
+            code_text = match.group(1).strip()
+            codes = [0] if not code_text else [int(c) for c in code_text.split(";") if c]
+            for code in codes:
+                if code == 0:
+                    current_color = default_color
+                    current_bold = False
+                elif code == 1:
+                    current_bold = True
+                elif code == 22:
+                    current_bold = False
+                elif code in fg_map:
+                    current_color = fg_map[code]
+                elif code == 39:
+                    current_color = default_color
+            last = match.end()
+
+        html_parts.append(apply_style(text[last:], current_color, current_bold))
+        return "".join(html_parts)
+
+    def append_log(self, message: str, channel: str = "info") -> None:
+        base_color = None
+        if channel == "stderr":
+            base_color = "#f14c4c"
+        elif channel == "info":
+            base_color = "#9cdcfe"
+
+        rendered = self.ansi_to_html(message, default_color=base_color)
+        self.log_box.moveCursor(QTextCursor.MoveOperation.End)
+        self.log_box.insertHtml(rendered + "<br>")
+        self.log_box.moveCursor(QTextCursor.MoveOperation.End)
 
 
 def main() -> int:
