@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 
 DATE_FMT = "%Y-%m-%d %H:%M:%S"
 DATA_FILE = Path("tasks.json")
+LOG_DIR = Path("log")
 
 
 @dataclass
@@ -51,6 +52,31 @@ class Task:
     last_run: Optional[str] = None
     next_run: Optional[str] = None
     last_status: str = "未运行"
+
+
+class TaskFileLogger:
+    def __init__(self, base_dir: Path) -> None:
+        self.base_dir = base_dir
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _safe_name(name: str) -> str:
+        safe = re.sub(r"[\\/:*?\"<>|]+", "_", name.strip())
+        safe = safe.replace(" ", "_")
+        return safe or "unnamed_task"
+
+    def _task_dir(self, task: Task) -> Path:
+        task_dir = f"{self._safe_name(task.name)}_{task.task_id[:8]}"
+        return self.base_dir / task_dir
+
+    def write(self, task: Task, line: str) -> None:
+        now = datetime.now()
+        day_file = self._task_dir(task) / f"{now.strftime('%Y-%m-%d')}.log"
+        payload = f"[{now.strftime(DATE_FMT)}] {line}\n"
+        with self.lock:
+            day_file.parent.mkdir(parents=True, exist_ok=True)
+            with day_file.open("a", encoding="utf-8") as fp:
+                fp.write(payload)
 
 
 class TaskDialog(QDialog):
@@ -127,11 +153,22 @@ class SchedulerEngine(QWidget):
         super().__init__()
         self.tasks = tasks
         self.lock = threading.Lock()
+        self.file_logger = TaskFileLogger(LOG_DIR)
 
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
         self.timer.timeout.connect(self.tick)
         self.timer.start()
+
+    def emit_task_log(self, task: Task, message: str, channel: str = "info") -> None:
+        self.log_generated.emit(message, channel)
+        try:
+            self.file_logger.write(task, f"[{channel}] {message}")
+        except Exception as exc:
+            self.log_generated.emit(
+                f"[{datetime.now().strftime(DATE_FMT)}] [日志写入失败] [{task.name}] {exc}",
+                "stderr",
+            )
 
     def recalc_next_run(self, task: Task, base_time: Optional[datetime] = None) -> None:
         if not task.enabled:
@@ -171,7 +208,8 @@ class SchedulerEngine(QWidget):
             start = datetime.now()
             cmd = task.command
             reason = "手动触发" if manual else "定时触发"
-            self.log_generated.emit(
+            self.emit_task_log(
+                task,
                 f"[{start.strftime(DATE_FMT)}] [{task.name}] 开始执行 ({reason}): {cmd}",
                 "info",
             )
@@ -200,11 +238,11 @@ class SchedulerEngine(QWidget):
                         ch = pipe.read(1)
                         if ch == "":
                             if buf:
-                                self.log_generated.emit(f"[{task.name}] {buf}", stream_name)
+                                self.emit_task_log(task, f"[{task.name}] {buf}", stream_name)
                             break
                         if ch in ("\r", "\n"):
                             if buf:
-                                self.log_generated.emit(f"[{task.name}] {buf}", stream_name)
+                                self.emit_task_log(task, f"[{task.name}] {buf}", stream_name)
                                 buf = ""
                             continue
                         buf += ch
@@ -230,7 +268,8 @@ class SchedulerEngine(QWidget):
                     if manual and task.enabled:
                         self.recalc_next_run(task, end)
 
-                self.log_generated.emit(
+                self.emit_task_log(
+                    task,
                     f"[{end.strftime(DATE_FMT)}] [{task.name}] 执行完成: {status}",
                     "info",
                 )
@@ -239,7 +278,8 @@ class SchedulerEngine(QWidget):
                 with self.lock:
                     task.last_run = fail_time.strftime(DATE_FMT)
                     task.last_status = f"异常: {exc}"
-                self.log_generated.emit(
+                self.emit_task_log(
+                    task,
                     f"[{fail_time.strftime(DATE_FMT)}] [{task.name}] 执行异常: {exc}",
                     "stderr",
                 )
